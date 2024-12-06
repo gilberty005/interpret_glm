@@ -10,8 +10,7 @@ Original file is located at
 """
 
 import os
-from typing import Optional
-
+from typing import Optional, List, Tuple, Dict, Union
 import numpy as np
 import pandas as pd
 import torch
@@ -31,7 +30,7 @@ def create_file(dir: str, file_name: str) -> None:
 def get_layer_activations(
     tokenizer: PreTrainedTokenizer,
     plm: PreTrainedModel,
-    seqs: list[str],
+    seqs: List[str],
     layer: int,
     device: Optional[torch.device] = None,
 ) -> torch.Tensor:
@@ -63,7 +62,7 @@ def get_layer_activations(
 
 def train_val_test_split(
     df: pd.DataFrame, train_frac: float = 0.9
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     Split the sequences into training, validation, and test sets. train_frac specifies
     the fraction of examples to use for training; the rest is split evenly between
@@ -90,7 +89,7 @@ def train_val_test_split(
     return seqs_train, seqs_val, seqs_test
 
 
-def parse_swissprot_annotation(annotation_str: str, header: str) -> list[dict]:
+def parse_swissprot_annotation(annotation_str: str, header: str) -> List[dict]:
     """
     Parse a SwissProt annotation string like this:
 
@@ -268,7 +267,7 @@ class SparseAutoencoder(nn.Module):
 
     def LN(
         self, x: torch.Tensor, eps: float = 1e-5
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Apply Layer Normalization to the input tensor.
 
@@ -301,7 +300,7 @@ class SparseAutoencoder(nn.Module):
         dead_mask = self.stats_last_nonzero > self.dead_steps_threshold
         return dead_mask
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Forward pass of the Sparse Autoencoder. If there are dead neurons, compute the
         reconstruction using the AUXK auxiliary hidden dims as well.
@@ -427,7 +426,7 @@ class SparseAutoencoder(nn.Module):
 
 def loss_fn(
     x: torch.Tensor, recons: torch.Tensor, auxk: Optional[torch.Tensor] = None
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Compute the loss function for the Sparse Autoencoder.
 
@@ -703,7 +702,7 @@ class SparseAutoencoder(nn.Module):
 
     def LN(
         self, x: torch.Tensor, eps: float = 1e-5
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Apply Layer Normalization to the input tensor.
 
@@ -736,7 +735,7 @@ class SparseAutoencoder(nn.Module):
         dead_mask = self.stats_last_nonzero > self.dead_steps_threshold
         return dead_mask
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Forward pass of the Sparse Autoencoder. If there are dead neurons, compute the
         reconstruction using the AUXK auxiliary hidden dims as well.
@@ -862,7 +861,7 @@ class SparseAutoencoder(nn.Module):
 
 def loss_fn(
     x: torch.Tensor, recons: torch.Tensor, auxk: Optional[torch.Tensor] = None
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Compute the loss function for the Sparse Autoencoder.
 
@@ -1086,19 +1085,19 @@ from transformers import AutoTokenizer, AutoModelForMaskedLM
 tokenizer = AutoTokenizer.from_pretrained("facebook/esm2_t33_650M_UR50D")
 model = AutoModelForMaskedLM.from_pretrained("facebook/esm2_t33_650M_UR50D")
 
-from google.colab import drive
-drive.mount('/content/drive')
+# from google.colab import drive
+# drive.mount('/content/drive')
 
 wandb.finish()
 
 # Define the arguments manually
 args = SimpleNamespace(
-    data_dir="drive/MyDrive/data_sae/uniref50_1M_1022.parquet",
-    esm2_weight="drive/MyDrive/data_sae/esm2_t33_650M_UR50D.pt",
+    data_dir="uniref50_1M_1022.parquet",
+    esm2_weight="esm2_t33_650M_UR50D.pt",
     #esm2_weight = "https://dl.fbaipublicfiles.com/fair-esm/models/esm2_t33_650M_UR50D.pt",
     layer_to_use=24,
     d_model=1280,
-    d_hidden=8192, #too large, trying 2^13 instead from 2^15 
+    d_hidden=8192,
     batch_size=4,
     lr=2e-4,
     k=128,
