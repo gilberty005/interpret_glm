@@ -1,8 +1,8 @@
 #!/bin/bash
-#SBATCH --time=0-05:00            
-#SBATCH --mem=16G                
-#SBATCH --cpus-per-task=12         
-#SBATCH --gpus-per-node=24
+#SBATCH --time=00:05:00
+#SBATCH --mem=256G
+#SBATCH --cpus-per-task=32
+#SBATCH --gpus-per-node=8
 #SBATCH --account pmg
 
 python sae.py 
