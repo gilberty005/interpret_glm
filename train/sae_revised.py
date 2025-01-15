@@ -9,6 +9,7 @@ Original file is located at
 #Utils
 """
 
+#utils.py
 import os
 from typing import Optional, List, Tuple, Dict, Union
 import numpy as np
@@ -32,7 +33,7 @@ def create_file(dir: str, file_name: str) -> None:
 def get_layer_activations(
     tokenizer: PreTrainedTokenizer,
     plm: PreTrainedModel,
-    seqs: List[str],
+    seqs: list[str],
     layer: int,
     device: Optional[torch.device] = None,
 ) -> torch.Tensor:
@@ -59,13 +60,14 @@ def get_layer_activations(
             #raise ValueError("Model did not return hidden states.")
     layer_acts = outputs.hidden_states[layer]
     del outputs
-
     return layer_acts
 
-
+#changes to polar occur here
+#note previously, polars was imported as pl, which is also pytorch_lighting cauing issues
+#thus, polars has been changed here to be strictly linked to pr
 def train_val_test_split(
-    df: pd.DataFrame, train_frac: float = 0.9
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    df: pr.DataFrame, train_frac: float = 0.9
+) -> Tuple[pr.DataFrame, pr.DataFrame, pr.DataFrame]:
     """
     Split the sequences into training, validation, and test sets. train_frac specifies
     the fraction of examples to use for training; the rest is split evenly between
@@ -80,15 +82,15 @@ def train_val_test_split(
     Returns:
         A tuple containing the training, validation, and test sets.
     """
-    is_train = pd.Series(
+    is_train = pr.Series(
         np.random.choice([True, False], size=len(df), p=[train_frac, 1 - train_frac])
     )
-    seqs_train = df[is_train]
-    seqs_val_test = df[~is_train].reset_index(drop=True)
+    seqs_train = df.filter(is_train)
+    seqs_val_test = df.filter(~is_train)
 
-    is_val = pd.Series(np.random.choice([True, False], size=len(seqs_val_test), p=[0.1, 0.9]))
-    seqs_val = seqs_val_test[is_val]
-    seqs_test = seqs_val_test[~is_val]
+    is_val = pr.Series(np.random.choice([True, False], size=len(seqs_val_test), p=[0.1, 0.9]))
+    seqs_val = seqs_val_test.filter(is_val)
+    seqs_test = seqs_val_test.filter(~is_val)
     return seqs_train, seqs_val, seqs_test
 
 
@@ -155,11 +157,12 @@ class PolarsDataset(Dataset):
         return len(self.df)
 
     def __getitem__(self, idx):
-        row = self.df.iloc[idx]
+        row = self.df.row(idx, named=True)
         return {"Sequence": row["sequence"], "Entry": row["id"]}
 
 
 # Data Module
+#polar as pr not pl here
 class SequenceDataModule(pl.LightningDataModule):
     def __init__(self, data_path, batch_size, num_workers=None):
         super().__init__()
@@ -168,7 +171,7 @@ class SequenceDataModule(pl.LightningDataModule):
         self.num_workers = num_workers if num_workers is not None else multiprocessing.cpu_count() - 1
 
     def setup(self, stage=None):
-        df = pd.read_parquet(self.data_path)
+        df = pr.read_parquet(self.data_path)
         self.train_data, self.val_data, self.test_data = train_val_test_split(df)
 
     def train_dataloader(self):
@@ -464,8 +467,7 @@ def loss_fn(
     else:
         auxk_loss = torch.tensor(0.0)
     return mse_loss, auxk_loss
-
-
+''' 
 def estimate_loss(
     plm: PreTrainedModel,
     tokenizer: PreTrainedTokenizer,
@@ -496,6 +498,7 @@ def estimate_loss(
 
     del layer_acts
     return np.mean(test_losses)
+    '''
 
 """#ESM Wrapper"""
 
@@ -566,55 +569,27 @@ class ESM2Model(pl.LightningModule):
         self.load_state_dict(ckpt)
 
     def compose_input(self, list_tuple_seq):
-      _, _, batch_tokens = self.batch_converter(list_tuple_seq)
-      device = next(self.parameters()).device
-      batch_tokens = batch_tokens.to(device)
-      return batch_tokens
-
-    def forward(self, tokens, output_hidden_states=False):
-        # Embedding
-        x = self.embed_scale * self.embed_tokens(tokens)
-
-        # Pass through layers
-        hidden_states = []
-        x = x.transpose(0, 1)  # (B, T, E) -> (T, B, E)
-        for layer in self.layers:
-            x, _ = layer(x)
-            if output_hidden_states:
-                hidden_states.append(x.transpose(0, 1))  # Store (B, T, E)
-
-        x = x.transpose(0, 1)  # (T, B, E) -> (B, T, E)
-        x = self.emb_layer_norm_after(x)
-
-        logits = self.lm_head(x)
-
-        outputs = {'logits': logits}
-        if output_hidden_states:
-            outputs['hidden_states'] = hidden_states
-        return outputs
+        _, _, batch_tokens = self.batch_converter(list_tuple_seq)
+        batch_tokens = batch_tokens.to(self.device)
+        return batch_tokens
 
     def get_layer_activations(self, input, layer_idx):
-      if isinstance(input, str):
-        tokens = self.compose_input([("protein", input)])
-      elif isinstance(input, list):
-        tokens = self.compose_input([("protein", seq) for seq in input])
-      else:
-        tokens = input
+        if isinstance(input, str):
+            tokens = self.compose_input([("protein", input)])
+        elif isinstance(input, list):
+            tokens = self.compose_input([("protein", seq) for seq in input])
+        else:
+            tokens = input
 
-      # Get the attention mask if needed
-      attention_mask = tokens.ne(self.padding_idx)
-
-      x = self.embed_scale * self.embed_tokens(tokens)
-      x = x.transpose(0, 1)  # (B, T, E) => (T, B, E)
-
-      # Process up to the desired layer
-      for idx, layer in enumerate(self.layers):
-          x, _ = layer(x, self_attn_padding_mask=attention_mask)
-          if idx == layer_idx - 1:
-              break
-
-      x = x.transpose(0, 1)  # (T, B, E) => (B, T, E)
-      return tokens, x
+        x = self.embed_scale * self.embed_tokens(tokens)
+        x = x.transpose(0, 1)  # (B, T, E) => (T, B, E)
+        for _, layer in enumerate(self.layers[:layer_idx]):
+            x, attn = layer(
+                x,
+                self_attn_padding_mask=None,
+                need_head_weights=False,
+            )
+        return tokens, x.transpose(0, 1)
 
     def get_sequence(self, x, layer_idx):
         x = x.transpose(0, 1)  # (B, T, E) => (T, B, E)
@@ -628,309 +603,70 @@ class ESM2Model(pl.LightningModule):
         x = x.transpose(0, 1)  # (T, B, E) => (B, T, E)
         logits = self.lm_head(x)
         return logits
-
-"""#SAE Model"""
-
-import math
-from typing import Optional
-
-import numpy as np
-import torch
-import torch.nn as nn
-from torch.nn import functional as F
-from transformers import PreTrainedModel, PreTrainedTokenizer
-
-class SparseAutoencoder(nn.Module):
-    def __init__(
-        self,
-        d_model: int,
-        d_hidden: int,
-        k: int = 128,
-        auxk: int = 256,
-        batch_size: int = 256,
-        dead_steps_threshold: int = 2000,
-    ):
-        """
-        Initialize the Sparse Autoencoder.
-
-        Args:
-            d_model: Dimension of the pLM model.
-            d_hidden: Dimension of the SAE hidden layer.
-            k: Number of top-k activations to keep.
-            auxk: Number of auxiliary activations.
-            dead_steps_threshold: How many examples of inactivation before we consider
-                a hidden dim dead.
-
-        Adapted from https://github.com/tylercosgrove/sparse-autoencoder-mistral7b/blob/main/sae.py
-        based on 'Scaling and evaluating sparse autoencoders' (Gao et al. 2024) https://arxiv.org/pdf/2406.04093
-        """
-        super().__init__()
-
-        self.w_enc = nn.Parameter(torch.empty(d_model, d_hidden))
-        self.w_dec = nn.Parameter(torch.empty(d_hidden, d_model))
-
-        self.b_enc = nn.Parameter(torch.zeros(d_hidden))
-        self.b_pre = nn.Parameter(torch.zeros(d_model))
-
-        self.d_model = d_model
-        self.d_hidden = d_hidden
-        self.k = k
-        self.auxk = auxk
-        self.batch_size = batch_size
-
-        self.dead_steps_threshold = dead_steps_threshold / batch_size
-
-        # TODO: Revisit to see if this is the best way to initialize
-        nn.init.kaiming_uniform_(self.w_enc, a=math.sqrt(5))
-        self.w_dec.data = self.w_enc.data.T.clone()
-        self.w_dec.data /= self.w_dec.data.norm(dim=0)
-
-        # Initialize dead neuron tracking. For each hidden dimension, save the
-        # index of the example at which it was last activated.
-        self.register_buffer("stats_last_nonzero", torch.zeros(d_hidden, dtype=torch.long))
-
-    def topK_activation(self, x: torch.Tensor, k: int) -> torch.Tensor:
-        """
-        Apply top-k activation to the input tensor.
-
-        Args:
-            x: (BATCH_SIZE, D_EMBED, D_MODEL) input tensor to apply top-k activation on.
-            k: Number of top activations to keep.
-
-        Returns:
-            torch.Tensor: Tensor with only the top k activations preserved,and others
-            set to zero.
-
-        This function performs the following steps:
-        1. Find the top k values and their indices in the input tensor.
-        2. Apply ReLU activation to these top k values.
-        3. Create a new tensor of zeros with the same shape as the input.
-        4. Scatter the activated top k values back into their original positions.
-        """
-        topk = torch.topk(x, k=k, dim=-1, sorted=False)
-        values = F.relu(topk.values)
-        result = torch.zeros_like(x)
-        result.scatter_(-1, topk.indices, values)
-        return result
-
-    def LN(
-        self, x: torch.Tensor, eps: float = 1e-5
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Apply Layer Normalization to the input tensor.
-
-        Args:
-            x: Input tensor to be normalized.
-            eps: A small value added to the denominator for numerical stability.
-
-        Returns:
-            tuple[torch.Tensor, torch.Tensor, torch.Tensor]: A tuple containing:
-                - The normalized tensor.
-                - The mean of the input tensor.
-                - The standard deviation of the input tensor.
-
-        TODO: Is eps = 1e-5 the best value?
-        """
-        mu = x.mean(dim=-1, keepdim=True)
-        x = x - mu
-        std = x.std(dim=-1, keepdim=True)
-        x = x / (std + eps)
-        return x, mu, std
-
-    def auxk_mask_fn(self) -> torch.Tensor:
-        """
-        Create a mask for dead neurons.
-
-        Returns:
-            torch.Tensor: A boolean tensor of shape (D_HIDDEN,) where True indicates
-                a dead neuron.
-        """
-        dead_mask = self.stats_last_nonzero > self.dead_steps_threshold
-        return dead_mask
-
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Forward pass of the Sparse Autoencoder. If there are dead neurons, compute the
-        reconstruction using the AUXK auxiliary hidden dims as well.
-
-        Args:
-            x: (BATCH_SIZE, D_EMBED, D_MODEL) input tensor to the SAE.
-
-        Returns:
-            tuple[torch.Tensor, torch.Tensor, torch.Tensor]: A tuple containing:
-                - The reconstructed activations via top K hidden dims.
-                - If there are dead neurons, the auxiliary activations via top AUXK
-                    hidden dims; otherwise, None.
-                - The number of dead neurons.
-        """
-        x, mu, std = self.LN(x)
-        x = x - self.b_pre
-
-        pre_acts = x @ self.w_enc + self.b_enc
-
-        # latents: (BATCH_SIZE, D_EMBED, D_HIDDEN)
-        latents = self.topK_activation(pre_acts, k=self.k)
-
-        # `(latents == 0)` creates a boolean tensor element-wise from `latents`.
-        # `.all(dim=(0, 1))` preserves D_HIDDEN and does the boolean `all`
-        # operation across BATCH_SIZE and D_EMBED. Finally, `.long()` turns
-        # it into a vector of 0s and 1s of length D_HIDDEN.
-        #
-        # self.stats_last_nonzero is a vector of length D_HIDDEN. Doing
-        # `*=` with `M = (latents == 0).all(dim=(0, 1)).long()` has the effect
-        # of: if M[i] = 0, self.stats_last_nonzero[i] is cleared to 0, and then
-        # immediately incremented; if M[i] = 1, self.stats_last_nonzero[i] is
-        # unchanged. self.stats_last_nonzero[i] means "for how many consecutive
-        # iterations has hidden dim i been zero".
-        self.stats_last_nonzero *= (latents == 0).all(dim=(0, 1)).long()
-        self.stats_last_nonzero += 1
-
-        dead_mask = self.auxk_mask_fn()
-        num_dead = dead_mask.sum().item()
-
-        recons = latents @ self.w_dec + self.b_pre
-        recons = recons * std + mu
-
-        if num_dead > 0:
-            k_aux = min(x.shape[-1] // 2, num_dead)
-
-            auxk_latents = torch.where(dead_mask[None], pre_acts, -torch.inf)
-            auxk_acts = self.topK_activation(auxk_latents, k=k_aux)
-
-            auxk = auxk_acts @ self.w_dec + self.b_pre
-            auxk = auxk * std + mu
-        else:
-            auxk = None
-
-        return recons, auxk, num_dead
-
-    @torch.no_grad()
-    def forward_val(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass of the Sparse Autoencoder for validation.
-
-        Args:
-            x: (BATCH_SIZE, D_EMBED, D_MODEL) input tensor to the SAE.
-
-        Returns:
-            torch.Tensor: The reconstructed activations via top K hidden dims.
-        """
-        x, mu, std = self.LN(x)
-        x = x - self.b_pre
-        pre_acts = x @ self.w_enc + self.b_enc
-        latents = self.topK_activation(pre_acts, self.k)
-
-        recons = latents @ self.w_dec + self.b_pre
-        recons = recons * std + mu
-        return recons
-
-    @torch.no_grad()
-    def norm_weights(self) -> None:
-        """
-        Normalize the weights of the Sparse Autoencoder.
-        """
-        self.w_dec.data /= self.w_dec.data.norm(dim=0)
-
-    @torch.no_grad()
-    def norm_grad(self) -> None:
-        """
-        Normalize the gradient of the weights of the Sparse Autoencoder.
-        """
-        dot_products = torch.sum(self.w_dec.data * self.w_dec.grad, dim=0)
-        self.w_dec.grad.sub_(self.w_dec.data * dot_products.unsqueeze(0))
-
-    @torch.no_grad()
-    def get_acts(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Get the activations of the Sparse Autoencoder.
-
-        Args:
-            x: (BATCH_SIZE, D_EMBED, D_MODEL) input tensor to the SAE.
-
-        Returns:
-            torch.Tensor: The activations of the Sparse Autoencoder.
-        """
-        x, _, _ = self.LN(x)
-        x = x - self.b_pre
-        pre_acts = x @ self.w_enc + self.b_enc
-        latents = self.topK_activation(pre_acts, self.k)
-        return latents
-
-    @torch.no_grad()
-    def encode(self, x: torch.Tensor) -> torch.Tensor:
-        x, mu, std = self.LN(x)
-        x = x - self.b_pre
-        acts = x @ self.w_enc + self.b_enc
-        return acts, mu, std
-
-    @torch.no_grad()
-    def decode(self, acts: torch.Tensor, mu: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
-        latents = self.topK_activation(acts, self.k)
-
-        recons = latents @ self.w_dec + self.b_pre
-        recons = recons * std + mu
-        return recons
-
-
-def loss_fn(
-    x: torch.Tensor, recons: torch.Tensor, auxk: Optional[torch.Tensor] = None
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    
+"""#Validation Metrics"""
+def diff_cross_entropy(orig_logits, recons_logits, tokens):
     """
-    Compute the loss function for the Sparse Autoencoder.
+    Calculates the difference in cross-entropy between two sets of logits.
+
+    This function is used in the validation step of the SAE model.
+    """
+    orig_logits = orig_logits.view(-1, orig_logits.size(-1))
+    recons_logits = recons_logits.view(-1, recons_logits.size(-1))
+    tokens = tokens.view(-1)
+    orig_loss = F.cross_entropy(orig_logits, tokens).mean().item()
+    recons_loss = F.cross_entropy(recons_logits, tokens).mean().item()
+    return recons_loss - orig_loss
+
+
+def calc_diff_cross_entropy(seq, layer, esm2_model, sae_model):
+    """
+    Calculates the difference in cross-entropy when splicing in the SAE model.
+    Wrapper around diff_cross_entropy.
 
     Args:
-        x: (BATCH_SIZE, D_EMBED, D_MODEL) input tensor to the SAE.
-        recons: (BATCH_SIZE, D_EMBED, D_MODEL) reconstructed activations via top K
-            hidden dims.
-        auxk: (BATCH_SIZE, D_EMBED, D_MODEL) auxiliary activations via top AUXK
-            hidden dims. See A.2. in https://arxiv.org/pdf/2406.04093.
-
+        seq: A string representing the sequence.
+        layer: The layer of the ESM model to use.
+        esm2_model: The ESM model.
+        sae_model: The SAE model.
+    
     Returns:
-        tuple[torch.Tensor, torch.Tensor]: A tuple containing:
-            - The MSE loss.
-            - The auxiliary loss.
+        float: The difference in cross-entropy.
     """
-    mse_scale = 1
-    auxk_coeff = 1.0 / 32.0  # TODO: Is this the best coefficient?
+    tokens, esm_layer_acts = esm2_model.get_layer_activations(seq, layer)
+    recons, auxk, num_dead = sae_model(esm_layer_acts)
+    logits_recon = esm2_model.get_sequence(recons, layer)
+    logits_orig = esm2_model.get_sequence(esm_layer_acts, layer)
 
-    mse_loss = mse_scale * F.mse_loss(recons, x)
-    if auxk is not None:
-        auxk_loss = auxk_coeff * F.mse_loss(auxk, x - recons).nan_to_num(0)
-    else:
-        auxk_loss = torch.tensor(0.0)
-    return mse_loss, auxk_loss
+    return diff_cross_entropy(logits_orig, logits_recon, tokens)
 
 
-def estimate_loss(
-    plm: PreTrainedModel,
-    tokenizer: PreTrainedTokenizer,
-    layer: int,
-    sae_model: SparseAutoencoder,
-    examples_set: pd.DataFrame,
-    sample_size: int = 100,
-):
+def calc_loss_recovered(seq, layer, esm2_model, sae_model):
     """
-    Estimate the loss of the Sparse Autoencoder using a set of examples.
+    Calculates the "loss recovered": 1- \frac{CE(recons) - CE(orig)}{CE(zeros) - CE(orig)}.
+    Wrapper around diff_cross_entropy.
 
     Args:
-        sae_model: The Sparse Autoencoder model.
-        examples_set: The examples set to estimate the loss on.
-        sample_size: The number of examples to sample.
-
+        seq: A string representing the sequence.
+        layer: The layer of the ESM model to use.
+        esm2_model: The ESM model.
+        sae_model: The SAE model.
+    
     Returns:
-        float: The estimated loss.
+        float: The loss recovered.
     """
-    samples = examples_set.sample(sample_size)
-    test_losses = []
-    seqs = [row["Sequence"] for row in samples.iter_rows(named=True)]
-    layer_acts = get_layer_activations(tokenizer=tokenizer, plm=plm, seqs=seqs, layer=layer)
+    tokens, esm_layer_acts = esm2_model.get_layer_activations(seq, layer)
+    recons, auxk, num_dead = sae_model(esm_layer_acts)
+    logits_recon = esm2_model.get_sequence(recons, layer)
+    logits_orig = esm2_model.get_sequence(esm_layer_acts, layer)
+    
+    zeros_act = torch.zeros_like(esm_layer_acts)
+    logits_zeros = esm2_model.get_sequence(zeros_act, layer)
 
-    recons = sae_model.forward_val(layer_acts)
-    mse_loss, _ = loss_fn(layer_acts, recons)
-    test_losses.append(mse_loss.item())
+    diff_CE = diff_cross_entropy(logits_orig, logits_recon, tokens)
+    diff_CE_zeros = diff_cross_entropy(logits_orig, logits_zeros, tokens)
 
-    del layer_acts
-    return np.mean(test_losses)
+    return 1 - (diff_CE / diff_CE_zeros)
 
 """#SAE Module"""
 
@@ -941,18 +677,18 @@ import torch.nn.functional as F
 
 def get_esm_model(d_model, alphabet, esm2_weight):
     esm2_model = ESM2Model(
-        num_layers=33,
-        embed_dim=d_model,
-        attention_heads=20,
-        alphabet=alphabet,
-        token_dropout=False,
-    )
-    state_dict = torch.load(esm2_weight)
-    esm2_model.load_state_dict(state_dict, strict=False)
-
+            num_layers=33,
+            embed_dim=d_model,
+            attention_heads=20,
+            alphabet=alphabet,
+            token_dropout=False,
+        )
+    esm2_model.load_esm_ckpt(esm2_weight)
     esm2_model.eval()
     for param in esm2_model.parameters():
         param.requires_grad = False
+    esm2_model.cuda()
+    
     return esm2_model
 
 class SAELightningModule(pl.LightningModule):
@@ -970,12 +706,9 @@ class SAELightningModule(pl.LightningModule):
             dead_steps_threshold=args.dead_steps_threshold,
         )
         self.alphabet = esm.data.Alphabet.from_architecture("ESM-1b")
+        self.validation_step_outputs = []
+        # Initialize esm2_model here
         self.esm2_model = get_esm_model(self.args.d_model, self.alphabet, self.args.esm2_weight)
-
-    def on_fit_start(self):
-        device = self.device
-        self.esm2_model.to(device)
-        self.sae_model.to(device)
 
     def forward(self, x):
         return self.sae_model(x)
@@ -983,14 +716,19 @@ class SAELightningModule(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         seqs = batch["Sequence"]
         batch_size = len(seqs)
+        # Use the pre-initialized esm2_model
         with torch.no_grad():
             tokens, esm_layer_acts = self.esm2_model.get_layer_activations(seqs, self.layer_to_use)
-
-        esm_layer_acts = esm_layer_acts.to(self.device)
         recons, auxk, num_dead = self(esm_layer_acts)
         mse_loss, auxk_loss = loss_fn(esm_layer_acts, recons, auxk)
+        '''
+        with torch.no_grad():
+            esm2_model = get_esm_model(self.args.d_model, self.alphabet, self.args.esm2_weight)
+            tokens, esm_layer_acts = esm2_model.get_layer_activations(seqs, self.layer_to_use)
+        recons, auxk, num_dead = self(esm_layer_acts)
+        mse_loss, auxk_loss = loss_fn(esm_layer_acts, recons, auxk)
+        '''
         loss = mse_loss + auxk_loss
-
         self.log(
             "train_loss",
             loss,
@@ -1027,48 +765,63 @@ class SAELightningModule(pl.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        seqs = batch["Sequence"]
-        batch_size = len(seqs)
+        val_seqs = batch["Sequence"]
+        batch_size = len(val_seqs)
+        # Use the pre-initialized esm2_model
         with torch.no_grad():
-            tokens, esm_layer_acts = self.esm2_model.get_layer_activations(seqs, self.layer_to_use)
-            esm_layer_acts = esm_layer_acts.to(self.device)
-            recons, auxk, num_dead = self(esm_layer_acts)
-            mse_loss, auxk_loss = loss_fn(esm_layer_acts, recons, auxk)
-            loss = mse_loss + auxk_loss
-            logits = self.esm2_model.get_sequence(recons, self.layer_to_use)
-            logits = logits.view(-1, logits.size(-1))
-            tokens = tokens.view(-1)
-            correct = (torch.argmax(logits, dim=-1) == tokens).sum().item()
-            total = tokens.size(0)
+            esm2_model = self.esm2_model
+        '''
+        with torch.no_grad():
+            esm2_model = get_esm_model(
+                self.args.d_model, self.alphabet, self.args.esm2_weight
+            )
+        '''
+        diff_CE_all = torch.zeros(batch_size, device=self.device)
+        mse_loss_all = torch.zeros(batch_size, device=self.device)
 
+        # Running inference one sequence at a time
+        for i, seq in enumerate(val_seqs):
+            tokens, esm_layer_acts = esm2_model.get_layer_activations(
+                seq, self.layer_to_use
+            )
+
+            # Calculate MSE
+            recons = self.sae_model.forward_val(esm_layer_acts)
+            mse_loss, auxk_loss = loss_fn(esm_layer_acts, recons, None)
+            mse_loss_all[i] = mse_loss
+
+            # Calculate difference in cross-entropy
+            orig_logits = esm2_model.get_sequence(esm_layer_acts, self.layer_to_use)
+            spliced_logits = esm2_model.get_sequence(recons, self.layer_to_use)
+            diff_CE = diff_cross_entropy(orig_logits, spliced_logits, tokens)
+            diff_CE_all[i] = diff_CE
+
+        val_metrics = {
+            "mse_loss": mse_loss_all.mean(),
+            "diff_cross_entropy": diff_CE_all.mean(),
+        }
+        # Return batch-level metrics for aggregation
+        self.validation_step_outputs.append(val_metrics)
+        return val_metrics
+    
+    def on_validation_epoch_end(self):
+        # Aggregate metrics across batches
+        avg_diff_cross_entropy = torch.stack(
+            [x["diff_cross_entropy"] for x in self.validation_step_outputs]
+        ).mean()
+        avg_mse_loss = torch.stack([x["mse_loss"] for x in self.validation_step_outputs]).mean()
+
+        # Log aggregated metrics
         self.log(
-            "val_celoss",
-            F.cross_entropy(logits, tokens).mean().item(),
-            on_step=True,
+            "avg_mse_loss", avg_mse_loss, on_epoch=True, prog_bar=True, logger=True
+        )
+        self.log(
+            "avg_diff_cross_entropy",
+            avg_diff_cross_entropy,
             on_epoch=True,
             prog_bar=True,
             logger=True,
-            batch_size=batch_size,
         )
-        self.log(
-            "val_acc",
-            correct / total,
-            on_step=True,
-            on_epoch=True,
-            prog_bar=True,
-            logger=True,
-            batch_size=batch_size,
-        )
-        self.log(
-            "val_loss",
-            loss,
-            on_step=True,
-            on_epoch=True,
-            prog_bar=True,
-            logger=True,
-            batch_size=batch_size,
-        )
-        return loss
 
     def test_step(self, batch, batch_idx):
         return self.validation_step(batch, batch_idx)
