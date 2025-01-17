@@ -863,13 +863,13 @@ args = SimpleNamespace(
     #esm2_weight = "https://dl.fbaipublicfiles.com/fair-esm/models/esm2_t33_650M_UR50D.pt",
     layer_to_use=24,
     d_model=1280,
-    d_hidden=8192,
-    batch_size=4,
+    d_hidden=16384,
+    batch_size=24,
     lr=2e-4,
     k=128,
     auxk=256,
     dead_steps_threshold=2000,
-    max_epochs=4,
+    max_epochs=1,
     num_devices=1,
 )
 
