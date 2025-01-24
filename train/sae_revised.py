@@ -900,6 +900,7 @@ checkpoint_callback = ModelCheckpoint(
 
 trainer = pl_lightning.Trainer(
     max_epochs=args.max_epochs,
+    max_steps=5000,
     accelerator="gpu",
     devices=list(range(args.num_devices)),
     strategy="ddp" if args.num_devices > 1 else "auto",
