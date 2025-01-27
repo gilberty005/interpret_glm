@@ -768,6 +768,7 @@ class SAELightningModule(pl.LightningModule):
         val_seqs = batch["Sequence"]
         batch_size = len(val_seqs)
         # Use the pre-initialized esm2_model
+        '''
         with torch.no_grad():
             esm2_model = self.esm2_model
         '''
@@ -775,7 +776,7 @@ class SAELightningModule(pl.LightningModule):
             esm2_model = get_esm_model(
                 self.args.d_model, self.alphabet, self.args.esm2_weight
             )
-        '''
+
         diff_CE_all = torch.zeros(batch_size, device=self.device)
         mse_loss_all = torch.zeros(batch_size, device=self.device)
 
@@ -797,9 +798,13 @@ class SAELightningModule(pl.LightningModule):
             diff_CE_all[i] = diff_CE
 
         val_metrics = {
+            "val_loss": mse_loss_all.mean(),  # Log val_loss here
             "mse_loss": mse_loss_all.mean(),
             "diff_cross_entropy": diff_CE_all.mean(),
         }
+        
+        self.log("val_loss", val_metrics["val_loss"], on_step=False, on_epoch=True, prog_bar=True, logger=True)
+
         # Return batch-level metrics for aggregation
         self.validation_step_outputs.append(val_metrics)
         return val_metrics
