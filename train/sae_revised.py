@@ -164,7 +164,7 @@ class PolarsDataset(Dataset):
 # Data Module
 #polar as pr not pl here
 class SequenceDataModule(pl.LightningDataModule):
-    def __init__(self, data_path, batch_size, num_workers=None):
+    def __init__(self, data_path, batch_size, num_workers=8):
         super().__init__()
         self.data_path = data_path
         self.batch_size = batch_size
@@ -803,7 +803,7 @@ class SAELightningModule(pl.LightningModule):
             "diff_cross_entropy": diff_CE_all.mean(),
         }
         
-        self.log("val_loss", val_metrics["val_loss"], on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        self.log("val_loss", val_metrics["val_loss"], on_step=False, on_epoch=True, prog_bar=True, logger=True, batch_size=batch_size)
 
         # Return batch-level metrics for aggregation
         self.validation_step_outputs.append(val_metrics)
@@ -917,7 +917,7 @@ trainer = pl_lightning.Trainer(
     gradient_clip_val=1.0,
 )
 
-trainer.fit(model, data_module)
+trainer.fit(model, data_module, ckpt_path="/burg/pmg/users/gy2322/results_l24_dim16384_k128/checkpoints/esm2_plm1280_l24_sae16384_k128_auxk256-step=4000-val_loss=16.12.ckpt")
 trainer.test(model, data_module)
 
 wandb.finish()
