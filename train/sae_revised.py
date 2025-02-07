@@ -849,6 +849,8 @@ import numpy as np
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
 
+wandb.login(key="d21c34085b863cf1b81896183cf457035c56f923")
+
 model_weights, alphabet = esm.pretrained.esm2_t33_650M_UR50D()
 
 from transformers import AutoTokenizer, AutoModelForMaskedLM
@@ -875,7 +877,7 @@ args = SimpleNamespace(
     auxk=256,
     dead_steps_threshold=2000,
     max_epochs=1,
-    num_devices=1,
+    num_devices=-1,
 )
 
 args.output_dir = f"results_l{args.layer_to_use}_dim{args.d_hidden}_k{args.k}"
@@ -905,7 +907,6 @@ checkpoint_callback = ModelCheckpoint(
 
 trainer = pl_lightning.Trainer(
     max_epochs=args.max_epochs,
-    max_steps=5000,
     accelerator="gpu",
     devices=list(range(args.num_devices)),
     strategy="ddp" if args.num_devices > 1 else "auto",
