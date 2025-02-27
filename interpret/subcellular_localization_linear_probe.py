@@ -45,7 +45,7 @@ esm_model.to(device)
 esm_model.eval()
 
 #include login token: 
-
+login(token='')
 
 # Load SAE model
 checkpoint_path = hf_hub_download(
