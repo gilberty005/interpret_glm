@@ -16,11 +16,41 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 from .mup_utils import MuReadoutS, MuSharedReadoutS
 from .baseformer import MuReadoutWrap, MuSharedReadout
 from .rotary import apply_rotary_pos_emb
+import torch.distributed.tensor.parallel as dist_tensor
+import torch.distributed._tensor as distp_tensor
+from torch.distributed._composable.fsdp import fully_shard
+from torch.distributed._composable.fsdp import MixedPrecisionPolicy
 import importlib
+from flash_attn.bert_padding import unpad_input
+from flash_attn.flash_attn_interface import (
+    flash_attn_varlen_kvpacked_func,
+    flash_attn_func,
+)
 from einops import repeat
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from lightning.fabric.utilities.init import _materialize_meta_tensors
 from functools import partial
-from lightning.pytorch.utilities.rank_zero import rank_zero_info, rank_zero_warn
+
+rfa_is_installed = importlib.util.find_spec("ring_flash_attn") is not None
+if rfa_is_installed:
+    from ring_flash_attn.ring_flash_attn_varlen import (
+        ring_flash_attn_varlen_kvpacked_func,
+    )
+    from ring_flash_attn.ring_flash_attn import ring_flash_attn_func
+    from ring_flash_attn.llama_fwd_ring_bwd_flash_attn import (
+        llama_fwd_ring_bwd_flash_attn_func,
+        llama_flash_attn_func,
+    )
+
+"""torch.compile flashattention
+Only works when install from repo after Sept 2024!
+Results may vary. Benchmark this.
+To disable, use context manager
+I could NOT disable compile like this: 
+if hasattr(flash_attn.flash_attn_interface, '_flash_attn_forward'):
+    torch.compiler.disable(flash_attn_func,recursive=True)
+"""
+
 
 class Embedding(nn.Embedding):
     """Do not need to zero the padding index because we do that at initialization
@@ -123,6 +153,151 @@ class ESM3s(nn.Module):
             self.lm_head = RobertaLMHead(**self.config["lm_head"])
         self.param_base_shape_and_mult = {}  # for standalone mup impl; [[base shape], width_mult]
 
+    def sp_parallelize(self, model, device_mesh, strategy):
+        """Set up sequence parallel
+        This function sets up the sp_mesh (pytorch DeviceMesh) attribute in the model.
+        Process group required for sequence parallel is defined in DeviceMash
+        cache_rot_emb needs to be called after model initialized if sin/cos RoPE tensors are cached
+        """
+        self.strategy = strategy
+        sp_mesh = device_mesh["sequence_parallel"]
+        if (sp_mesh is not None) and (sp_mesh.size() > 1):
+            assert self.config["transformer_layer"]["ring_attn"] is not None, (
+                "ring_attn=str if using sequence parallel"
+            )
+            assert self.config["transformer_layer"]["ring_attn"] in [
+                "llamafwd_ring",
+                "ring",
+                "llama_varlen",
+                "llama",
+                "ring_varlen",
+            ], (
+                f"ring_attn {self.config['transformer_layer']['ring_attn']} not implemented"
+            )
+            self.sp_mesh = (
+                sp_mesh  # Todo, this is temp fix for rope; rethink this approach
+            )
+            for layer_idx, layer in enumerate(model.layers):
+                layer.self_attn.mha.attn_fn.sp_mesh = sp_mesh
+        return model
+
+    def gradient_average_hook(self, param, device_mesh):
+        """register_post_accumulate_grad_hook Should trigger when gradient updated
+        param.grad gets modified without assignment by self.strategy.reduce
+        self.strategy.reduce is default mean reduced
+        """
+        process_group = device_mesh.get_group()  # List[ProcessGroup]
+        # maybe a problem if gradients are sharded?
+        self.strategy.reduce(
+            param.grad.to_local(), group=process_group
+        )  # require dtensor with registered mesh
+
+    def add_avg_tensor_hooks(self):
+        """add avg hook for sequence parallel
+        THis should be called after all parameters initalized and wrapped.
+        """
+        for n, p in self.named_parameters():
+            if p.requires_grad:
+                p.register_post_accumulate_grad_hook(
+                    partial(self.gradient_average_hook, **{"device_mesh": self.sp_mesh})
+                )
+
+    def st_parallelize(self, model, device_mesh, strategy):
+        "pytorch tensor parallel setup"
+        torch._dynamo.config.cache_size_limit = 200
+        # assert device_mesh is not None, 'Run configure_model in LightningModule and set self.device_mesh'
+        # if "sequence_parallel" in device_mesh.mesh_dim_names:
+        #     self.sp_parallelize(model, device_mesh, strategy)
+        tp_mesh = device_mesh["tensor_parallel"]
+        if tp_mesh.size() > 1:
+            for layer_idx, layer in enumerate(model.layers):
+                layer.self_attn.qknorm_rearrange.tp_mesh = tp_mesh
+        assert self.config["transformer_layer"]["ff_activation"] == "SwiGLUShard", (
+            "Use SwiGLUShard for TP"
+        )
+        tp_plan = {
+            "embed_tokens": dist_tensor.RowwiseParallel(
+                input_layouts=distp_tensor.Replicate(),
+                output_layouts=distp_tensor.Shard(dim=1),
+            ),
+            "emb_layernorm_after": dist_tensor.SequenceParallel(),
+            "lm_head": dist_tensor.PrepareModuleInput(
+                input_layouts=distp_tensor.Shard(1),
+                desired_input_layouts=distp_tensor.Replicate(),
+            ),
+            "lm_head.dense": dist_tensor.ColwiseParallel(
+                output_layouts=distp_tensor.Shard(-1), use_local_output=False
+            ),  # activation next
+            "lm_head.layernorm": dist_tensor.SequenceParallel(
+                use_local_output=False,
+            ),
+            "lm_head.out": dist_tensor.ColwiseParallel(
+                input_layouts=distp_tensor.Shard(1),
+                output_layouts=distp_tensor.Shard(-1),
+                use_local_output=False,
+            ),
+        }
+        model = dist_tensor.parallelize_module(model, tp_mesh, tp_plan)
+        for layer in model.layers:
+            """Attention module shard use the local number of heads
+            Note that qknorm_rearrange changes dimensions to (b h s d)
+            """
+            tp_layer_plan = {
+                "attn1_layernorm": dist_tensor.SequenceParallel(use_local_output=True),
+                "self_attn": dist_tensor.PrepareModuleInput(
+                    input_layouts=(distp_tensor.Shard(dim=1), None, None, None),
+                    desired_input_layouts=(distp_tensor.Replicate(), None, None, None),
+                    use_local_output=True,
+                ),
+                # ColwiseParallel expects same replicated input, outputs Shard(-1)
+                #  Emb dim / 2; Followed by 'b s (three h d) -> three b h s d', d = head dim; then apply rope
+                "self_attn.Wq": dist_tensor.ColwiseParallel(
+                    use_local_output=True
+                ),  # manual distribute in qknorm_rearrange
+                "self_attn.Wk": dist_tensor.ColwiseParallel(
+                    use_local_output=True
+                ),  # manual distribute in qknorm_rearrange
+                "self_attn.Wv": dist_tensor.ColwiseParallel(
+                    use_local_output=True
+                ),  # manual distribute in qknorm_rearrange
+                # Can't compile using PrepareModuleInput and PrepareModuleOutput for qknorm; don't know why
+                "self_attn.qknorm_rearrange.q_layernorm": dist_tensor.SequenceParallel(
+                    use_local_output=True
+                ),
+                "self_attn.qknorm_rearrange.k_layernorm": dist_tensor.SequenceParallel(
+                    use_local_output=True
+                ),
+                # Need full local sequence for rotary embedding, unless we implement a sharded RoPE (ToDo)
+                # qknorm_rearrange should be head-shard (b s h d)
+                # self_attn.mha.attn_fn head shard
+                # ring_attn_fn_varlen input (q, k, v, key_padding_mask, softmax_scale, tp_mesh)
+                "self_attn.out_proj": dist_tensor.RowwiseParallel(  # RowwiseParallel converts to Shard(-1) anyway, Shard(1) pointless
+                    input_layouts=distp_tensor.Shard(
+                        dim=-1
+                    ),  # if self.layers[0].ring_attn else distp_tensor.Shard(dim=2),
+                    output_layouts=distp_tensor.Shard(dim=1),
+                    use_local_output=True,
+                ),
+                "ff_layernorm": dist_tensor.SequenceParallel(use_local_output=True),
+                # take Replicate, output Shard(1)
+                "ffn.gfc.linear1": dist_tensor.ColwiseParallel(
+                    input_layouts=distp_tensor.Shard(dim=1), use_local_output=True
+                ),
+                "ffn.gfc.linear2": dist_tensor.ColwiseParallel(
+                    input_layouts=distp_tensor.Shard(dim=1), use_local_output=True
+                ),
+                "ffn.fc2": dist_tensor.RowwiseParallel(
+                    input_layouts=distp_tensor.Shard(dim=-1),
+                    output_layouts=distp_tensor.Shard(dim=1),
+                    use_local_output=True,
+                ),  # must be true due to residual
+            }
+            dist_tensor.parallelize_module(layer, tp_mesh, tp_layer_plan)
+        if "sequence_parallel" in device_mesh.mesh_dim_names:
+            self.sp_parallelize(model, device_mesh, strategy)
+
+        return model
+
     def get_rot_emb(
         self, end_index: int, dtype=torch.float32, start_index=0, rotary_base=10000
     ):
@@ -159,6 +334,50 @@ class ESM3s(nn.Module):
             assert rotary_length is not None
             return self.get_rot_emb(rotary_length, rotary_base=self.rotary_base)
 
+    def fsd_parallelize(self, model, dp_mesh, parallel_config):
+        """FSDP
+        todo: mesh can be 2D if Tensor parallel is not also used.
+        https://github.com/pytorch/pytorch/blob/main/torch/distributed/_composable/fsdp/fully_shard.py
+        We can to separately wrap embedding, (model.embed_tokens = fully_shard(model.embed_tokens, **fsdp_config))
+            However, our embedding layer is relatively small, so it's unnecessary.
+        """
+        # NOTE: Currently, the user is required to manually handle precision settings such as the `mp_policy` here
+        # because the model parallel strategy does not respect all settings of `Fabric(precision=...)` at the moment.
+        mp_policy = MixedPrecisionPolicy(
+            param_dtype=torch.float32, reduce_dtype=torch.float32
+        )
+        fsdp_config = {"mesh": dp_mesh, "mp_policy": mp_policy}
+        torch._dynamo.config.cache_size_limit = 200
+        for layer_idx, layer in enumerate(self.layers):
+            # Apply activation checkpointing
+            if self.config["gradient_checkpointing"]:
+                layer = checkpoint_wrapper(layer)
+
+            # As an optimization, do not reshard after forward for the last
+            # transformer block since FSDP would prefetch it immediately
+            if parallel_config["FSDP_reshard"]:
+                reshard_after_forward = (
+                    parallel_config["FSDP_reshard"]
+                    if int(layer_idx) < len(model.layers) - 1
+                    else False
+                )
+            else:
+                reshard_after_forward = False  # Saves communication by not resharding
+            model.layers[layer_idx] = fully_shard(
+                layer,
+                **fsdp_config,
+                reshard_after_forward=reshard_after_forward,
+            )
+        if self.config["activation_offload"]:
+            warnings.warn(
+                "activation_offload is untested. Might not be right way to apply and mutual exclude grad checkpoint"
+            )
+            model = offload_wrapper(model)
+        model.embed_tokens = fully_shard(
+            model.embed_tokens,
+            reshard_after_forward=parallel_config["FSDP_reshard"], **fsdp_config)
+        model = fully_shard(model, reshard_after_forward=False, **fsdp_config)
+        return model
 
     def forward(
         self,
@@ -264,8 +483,6 @@ class ESM3s(nn.Module):
         Both scaled residual projection (esm-style)
         """
         torch.manual_seed(self.seed)
-
-        # TODO: remove support for  init_weight_config:"scaled" since it's not maintained
         if "scaled" in self.init_weight_config and self.init_weight_config["scaled"]:
             "Assumes you already run mup.set_base_shapes()"
             warnings.warn(
@@ -314,10 +531,9 @@ class ESM3s(nn.Module):
             and self.init_weight_config["scaled_new"]
         ):
             """
-            Applies weight initialization based on paper (i.e., muTransfer or muP):
-            "Tensor Programs V: Tuning Large Neural Networks via Zero-Shot Hyperparameter Transfer" (arXiv:2203.03466)
+            Applies weight initialization based on MUP_SHAPES.
             Uses Table 8 formuation in mup paper (same as official repo)
-                i.e. hidden init_normal(std/sqrt(n)); output_weights * 1/width_mult
+                i.e. hidden init_normal(std/sqrt(n)); output * 1/width_mult
             All layers must be represented by MUP_SHAPES. Handle only weight & bias
             Layernorms, bias, embedding, and output layer all vector-like  not scaled  (inf dim=1)
                 https://github.com/microsoft/mup/blob/19814971934ef91dd546f88e913fc963e096d11c/mup/init.py#L22
@@ -328,62 +544,48 @@ class ESM3s(nn.Module):
                 "scaled_new and scaled is mutually exlusive"
             )
 
-            # Set no gradient calculation. This should be default for nn.init functions, but need to set for for other ops.
-            with torch.no_grad():
-                for name, module in self.named_modules():
-                    if hasattr(module, "weight"):
-                        # Match name excluding modifications from wrapper fn like compile or FSDP.
-                        # Set width_mult based on self.param_base_shape_and_mult
-                        if name + ".weight" not in self.param_base_shape_and_mult:
-                            match = next(
-                                (
-                                    key
-                                    for key in self.param_base_shape_and_mult
-                                    if key
-                                    in name.replace("_orig_mod.", "")
-                                    .replace("_checkpoint_wrapped_module.", "")
-                                    .replace("_fsdp_wrapped_module.", "")
-                                    + ".weight"
-                                ),
-                                None,
-                            )
-                            if match is None:
-                                raise RuntimeError(f'{name} not in param_base_shape_and_mult')
-                            width_mult = self.param_base_shape_and_mult[match][1]
-                        else:
-                            width_mult = self.param_base_shape_and_mult[name + ".weight"][1]
-                    if isinstance(module, (nn.Linear, nn.Conv1d)):
-                        mup_scale = width_mult**-0.5
-                        nn.init.normal_(
-                            module.weight,
-                            mean=0.0,
-                            std=self.init_weight_config["init_norm_std"] * mup_scale,
+            for name, module in self.named_modules():
+                if hasattr(module, "weight"):
+                    if name + ".weight" not in self.param_base_shape_and_mult:
+                        match = next(
+                            (
+                                key
+                                for key in self.param_base_shape_and_mult
+                                if key
+                                in name.replace("_orig_mod.", "")
+                                .replace("_checkpoint_wrapped_module.", "")
+                                .replace("_fsdp_wrapped_module.", "")
+                                + ".weight"
+                            ),
+                            None,
                         )
-                        if module.bias is not None:
-                            module.bias.data.zero_()
-                        rank_zero_info(f"{name}, mup_scale {mup_scale}")
-                        
-                        # Optional set Wq to zero. This is optional for muTransfer
-                        if ("zero_q_proj" in self.init_weight_config) and (
-                            self.init_weight_config["zero_q_proj"] and "Wq" in name):
-                            module.weight.data.zero_()
+                        width_mult = self.param_base_shape_and_mult[match][1]
+                    else:
+                        width_mult = self.param_base_shape_and_mult[name + ".weight"][1]
+                if isinstance(module, (nn.Linear, nn.Conv1d)):
+                    mup_scale = width_mult**-0.5
+                    nn.init.normal_(
+                        module.weight,
+                        mean=0.0,
+                        std=self.init_weight_config["init_norm_std"] * mup_scale,
+                    )
+                    if module.bias is not None:
+                        module.bias.data.zero_()
 
-                    elif isinstance(module, (nn.LayerNorm, nn.RMSNorm)):
-                        # bias is optional for Norms
-                        if hasattr(module, "bias") and (module.bias is not None):
-                            module.bias.data.zero_()
-                        module.weight.data.fill_(1.0)
+                elif isinstance(module, (nn.LayerNorm, nn.RMSNorm)):
+                    if hasattr(module, "bias") and (module.bias is not None):
+                        module.bias.data.zero_()
+                    module.weight.data.fill_(1.0)
 
-                    if issubclass(type(module), MuReadoutS):
-                        # output layer weight set to zero according to muP(see doc above)
-                        module.weight.data.zero_()
-                    elif isinstance(module, nn.Embedding):
-                        # muP table 8 implementation doesn't scale model input and output layer weights. (see doc above)
-                        nn.init.normal_(
-                            module.weight,
-                            mean=0.0,
-                            std=self.init_weight_config["init_norm_std"],
-                        )
+                if issubclass(type(module), MuReadoutS):
+                    module.weight.data.zero_()
+                elif isinstance(module, nn.Embedding):
+                    # muP table 8 implementation doesn't scale in and out weights; multiplies output in MuReadoutS
+                    nn.init.normal_(
+                        module.weight,
+                        mean=0.0,
+                        std=self.init_weight_config["init_norm_std"],
+                    )
         else:
             self.apply(self.standard_init_weights)
         print("weights initialized")
@@ -579,6 +781,200 @@ class QKNormRearrange(nn.Module):
             q, k, v = self.tp_out(q, k, v)
         return q, k, v
 
+    @torch.compiler.disable(recursive=True)
+    def tp_in(self, q, k, v):
+        return [
+            distp_tensor.DTensor.from_local(t, self.tp_mesh, [distp_tensor.Shard(-1)])
+            .redistribute(self.tp_mesh, [distp_tensor.Shard(1)])
+            .to_local()  # seq shard for norm (expect local seq shard)
+            for t in [q, k, v]
+        ]
+
+    @torch.compiler.disable(recursive=True)
+    def tp_out(self, q, k, v):
+        return [
+            distp_tensor.DTensor.from_local(t, self.tp_mesh, [distp_tensor.Shard(1)])
+            .redistribute(self.tp_mesh, [distp_tensor.Shard(2)])
+            .to_local()
+            for t in [q, k, v]
+        ]
+
+
+class FlashAttnSelf(nn.Module):
+    """Just runs flash attention
+    Modularized to allow tensor parallel"""
+
+    def __init__(self, dropout_p, ring_attn=None, heads_k_stride=2):
+        super().__init__()
+        self.dropout_p = dropout_p
+        self.ring_attn = ring_attn
+        if self.ring_attn is not None:
+            if self.ring_attn in ["llamafwd_ring", "ring", "llama_varlen", "llama"]:
+                self.attn_fn = RunRingFlashAttn(
+                    heads_k_stride=heads_k_stride, method=self.ring_attn
+                )
+            elif self.ring_attn in ["ring_varlen"]:
+                self.attn_fn = RunRingFlashAttnVarlen()
+            else:
+                raise RuntimeError(f"{self.ring_attn} not implemented")
+        else:
+            self.attn_fn = RunFlashAttn()
+
+    @torch.compiler.disable(recursive=True)
+    def forward(self, q, k, v, key_padding_mask=None, scale=None):
+        #  q.shape  b s h d
+        context = self.attn_fn(q, k, v, key_padding_mask, scale)
+        return context
+
+
+class RunRingFlashAttn(nn.Module):
+    """FlashAttention with RingAttention"""
+
+    def __init__(self, dropout_p=0.0, heads_k_stride=2, method="llamafwd_ring"):
+        super().__init__()
+        self.dropout_p = dropout_p
+        self.sp_mesh = None
+        self.method = method
+        if method == "llama":
+            self.ring_fn = partial(
+                llama_flash_attn_func,
+                heads_k_stride=heads_k_stride,
+            )
+        elif method == "llamafwd_ring":
+            self.ring_fn = partial(
+                llama_fwd_ring_bwd_flash_attn_func, heads_k_stride=heads_k_stride
+            )
+        elif method == "ring":
+            self.ring_fn = ring_flash_attn_func
+        else:
+            raise RuntimeError(f"ring attn method {method} not implemented")
+
+    @torch.compiler.disable(recursive=True)
+    def forward(
+        self,
+        q,
+        k,
+        v,
+        key_padding_mask=None,  # Doesn't accept key_padding_mask, but keep signature
+        softmax_scale=None,
+    ):
+        batch_size, _, _, head_dim = q.shape
+        # flash_attn_func takes (b s h d), unlike varlen
+        process_group = self.sp_mesh.get_group()
+
+        context = self.ring_fn(
+            q=q,
+            k=k,
+            v=v,
+            dropout_p=self.dropout_p if self.training else 0.0,
+            softmax_scale=softmax_scale,
+            group=process_group,
+        )
+        return context
+
+
+class RunRingFlashAttnVarlen(nn.Module):
+    """Varlen FlashAttention with RingAttention; assumes using TP"""
+
+    def __init__(self, dropout_p=0.0):
+        super().__init__()
+        self.dropout_p = dropout_p
+        self.sp_mesh = None
+
+    @torch.compiler.disable(recursive=True)
+    def forward(self, q, k, v, key_padding_mask, softmax_scale=None):
+        batch_size, s_size, _, head_dim = q.shape
+        process_group = self.sp_mesh.get_group()
+
+        q = rearrange(q, "b s h d -> (b s) h d", b=batch_size, d=head_dim)  # (b s) = (nnz)
+        q_cu_seqlens = torch.arange(
+            0, (batch_size + 1) * s_size, step=s_size, dtype=torch.int32, device=q.device
+        )
+
+        local_padding_mask = distp_tensor.distribute_tensor(
+            key_padding_mask, tp_mesh, [distp_tensor.Shard(1)]
+        ).to_local()
+
+        kv = torch.stack([k, v], dim=2)  #  b s two h d
+
+        # unpad_input kv (batch, seqlen, ...); output kv_unpad (total_nnz, ...)
+        kv_unpad, _, kv_cu_seqlens, kv_max_s = unpad_input(
+            kv,
+            local_padding_mask,  # key_padding_mask True means to keep, False means to mask out.
+        )
+
+        context = ring_flash_attn_varlen_kvpacked_func(
+            kv=kv_unpad,
+            q=q,
+            cu_seqlens=q_cu_seqlens,
+            max_seqlen=s_size,
+            dropout_p=self.dropout_p if self.training else 0.0,
+            softmax_scale=softmax_scale,
+            process_group=process_group,
+        )
+        context = rearrange(context, "(b s) h d -> b s h d", b=batch_size, d=head_dim)
+        return context
+
+
+class RunFlashAttn(nn.Module):
+    def __init__(self, dropout_p=0.0):
+        super().__init__()
+        self.dropout_p = dropout_p
+
+    @torch.compiler.disable(recursive=True)
+    def forward(self, q, k, v, key_padding_mask, softmax_scale=None):
+        batch_size, s_size, _, head_dim = q.shape
+
+        if key_padding_mask is not None:
+            if (
+                not key_padding_mask.any()
+            ):  # this induce graph break, unless you try conditional
+                key_padding_mask = None
+
+        if key_padding_mask is None:
+            # flash_attn_func input ((batch_size, seqlen, nheads, headdim))
+            context = flash_attn_func(
+                q=q,
+                k=k,
+                v=v,
+                dropout_p=self.dropout_p if self.training else 0.0,
+                softmax_scale=softmax_scale,
+            )
+        else:
+            q = rearrange(
+                q, "b s h d -> (b s) h d", b=batch_size, d=head_dim
+            )  # (b s) = (nnz)
+            kv = torch.stack([k, v], dim=2)  #  b s two h d
+            q_cu_seqlens = torch.arange(
+                0,
+                (batch_size + 1) * s_size,
+                step=s_size,
+                dtype=torch.int32,
+                device=q.device,
+            )
+            # unpad_input kv (batch, seqlen, ...); output kv_unpad (total_nnz, ...)
+            kv_unpad, _, kv_cu_seqlens, kv_max_s, _ = unpad_input(
+                kv,
+                key_padding_mask,  # key_padding_mask True means to keep, False means to mask out.
+            )
+            context = flash_attn_varlen_kvpacked_func(
+                kv=kv_unpad,
+                q=q,
+                cu_seqlens_q=q_cu_seqlens,
+                max_seqlen_q=s_size,
+                cu_seqlens_k=kv_cu_seqlens,
+                max_seqlen_k=kv_max_s,
+                dropout_p=self.dropout_p if self.training else 0.0,
+                softmax_scale=softmax_scale,
+            )
+            context = rearrange(
+                context,
+                "(b s) h d -> b s h d",  # for compatibility
+                b=batch_size,
+                d=head_dim,
+            )
+        return context
+
 
 class Esm3TorchMHASelf(nn.Module):
     """Self-attention using torch.F.scaled_dot_product_attention"""
@@ -602,7 +998,6 @@ class Esm3TorchMHASelf(nn.Module):
         ring_attn: bool = False,
         context_length: int = 1024,
         heads_k_stride=2,  # used by llama sequence parallel only
-        clamp_qkv: Optional[float]=None,  # Clamp the of qkv tensors between +-clamp_qkv for stability; positive float
         **kwargs,
     ) -> None:
         assert batch_first
@@ -619,7 +1014,7 @@ class Esm3TorchMHASelf(nn.Module):
         self.scaling = 1 / self.head_dim  # muTransfer
         self.rope_seq_dim = -3
         self.special_head_mask = [1] * (self.num_heads-self.num_special_heads) + [0] * (self.num_special_heads)
-        self.clamp_qkv = clamp_qkv
+  
         self.qk_layernorm = qk_layernorm
         if self.qk_layernorm:
             self.qknorm_rearrange = QKNormRearrange(
@@ -698,7 +1093,7 @@ class Esm3TorchMHASelf(nn.Module):
                     chunk_size = self.num_heads // tp_size
                     extra_heads = self.num_heads % tp_size
 
-                    if tp_rank < extra_heads: # If H % P b	  0, the first H % P ranks get one extra head
+                    if tp_rank < extra_heads: # If H % P ≠ 0, the first H % P ranks get one extra head
                         start = tp_rank * (chunk_size + 1)
                         end = start + (chunk_size + 1)
                     else:
@@ -762,12 +1157,6 @@ class Esm3TorchMHASelf(nn.Module):
                 if is_test:
                     qk_store_test[1] = (q, k)
 
-        if self.clamp_qkv is not None:
-            # Clamp values within +- clamp_qkv (optional); Potentially help stability
-            # (e.g., https://github.com/allenai/OLMo/blob/a87c459d038c049045b09a05c4987fdddb01393e/olmo/model.py#L940)
-            q, k, v = [
-                torch.clamp(t, min=-self.clamp_qkv, max=self.clamp_qkv) for t in [q,k,v]
-            ]
         if self.attn_method == "fa2pad":
             if key_padding_mask is not None:
                 key_padding_mask = ~key_padding_mask

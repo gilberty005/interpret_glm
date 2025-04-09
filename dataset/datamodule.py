@@ -14,7 +14,7 @@ from .dataset import (
     NucleotideSeqBatchFromHFTokenizerConverter,
     ModRopeCollateFn,
 )
-from .pred_dataset import PredDataset, PredCollateFn, PredModRopeCollateFn
+#from .pred_dataset import PredDataset, PredCollateFn, PredModRopeCollateFn
 from .multi_dataset import MultiFastaDataset
 
 
@@ -23,6 +23,7 @@ class DNATrainDataModule(L.LightningDataModule):
         self,
         tokenizer,
         train_config: Optional[Dict] = None,
+        rotary_config: Optional[Dict] = None,
         shm_dir: Optional[Path] = None,
         valid_config: Optional[Dict] = None,
         pred_config: Optional[Dict] = None,
@@ -42,12 +43,9 @@ class DNATrainDataModule(L.LightningDataModule):
         num_workers: int = 4,
         prefetch_factor: int = 4,
         infer_mult: int = 5,  # can also be float to reduce inference batch size
-        return_contig_indices: bool = False,
-        use_long_range_rope: bool = False,
-        rotary_base_scaling_factor: int = None,
-        long_range_rope_base: Optional[int] = None,
         bos_eos: bool = False,
         cls: bool = False,
+        return_contig_indices: bool = False,
         mask_prob: float = 0.15,
         variable_masking: Optional[List[float]] = None,
         variable_seq_len_worker: bool = False,  # Workers each load seq with different context_length
@@ -67,6 +65,7 @@ class DNATrainDataModule(L.LightningDataModule):
         super().__init__()
         self.tokenizer = tokenizer
         self.train_config = train_config
+        self.rotary_config = rotary_config
         self.shm_dir = shm_dir
         self.valid_config = valid_config
         self.pred_config = pred_config
@@ -82,10 +81,6 @@ class DNATrainDataModule(L.LightningDataModule):
         self.epoch_len = epoch_len
         self.batch_size = batch_size
         self.infer_mult = infer_mult
-        self.return_contig_indices = return_contig_indices
-        self.use_long_range_rope = use_long_range_rope
-        self.rotary_base_scaling_factor = rotary_base_scaling_factor
-        self.long_range_rope_base = long_range_rope_base
         self.bos_eos = bos_eos
         self.cls = cls
         self.mask_prob = mask_prob
@@ -343,7 +338,6 @@ class DNATrainDataModule(L.LightningDataModule):
                 for arg in [
                     "crop_frac",
                     "context_length",
-                    "return_contig_indices",
                     "rope_indices_concat_method",
                     "add_separator",
                     "padding",
@@ -366,6 +360,7 @@ class DNATrainDataModule(L.LightningDataModule):
             self.train_ds = MultiFastaDataset(**ds)
 
             if self.train_config["collate_fn_class"] == "ModRopeCollateFn":
+                self.train_config["collate_fn_args"]["rotary_config"] = self.rotary_config
                 for arg in [
                     "context_length",
                     "padding",
@@ -374,10 +369,6 @@ class DNATrainDataModule(L.LightningDataModule):
                     "cls",
                     "mode",
                     "variable_masking",
-                    "return_contig_indices",
-                    "use_long_range_rope",
-                    "rotary_base_scaling_factor",
-                    "long_range_rope_base",
                     "add_separator",
                 ]:  # context_length
                     if arg not in self.train_config["collate_fn_args"]:
@@ -474,7 +465,6 @@ class DNATrainDataModule(L.LightningDataModule):
                     for arg in [
                         "crop_frac",
                         "context_length",
-                        "return_contig_indices",
                         "rope_indices_concat_method",
                         "add_separator",
                         "padding",
@@ -500,6 +490,7 @@ class DNATrainDataModule(L.LightningDataModule):
                 val_ds = MultiFastaDataset(**ds)
 
                 if self.valid_config[s]["collate_fn_class"] == "ModRopeCollateFn":
+                    self.valid_config[s]["collate_fn_args"]["rotary_config"] = self.rotary_config
                     for arg in [
                         "context_length",
                         "padding",
@@ -508,10 +499,6 @@ class DNATrainDataModule(L.LightningDataModule):
                         "cls",
                         "mode",
                         "variable_masking",
-                        "return_contig_indices",
-                        "use_long_range_rope",
-                        "rotary_base_scaling_factor",
-                        "long_range_rope_base",
                         "add_separator",
                     ]:  # context_length
                         if arg not in self.valid_config[s]["collate_fn_args"]:
@@ -580,7 +567,15 @@ class DNATrainDataModule(L.LightningDataModule):
                     if arg not in self.pred_config["collate_fn_args"]:
                         self.pred_config["collate_fn_args"][arg] = getattr(self, arg)
                 if "generator" not in self.pred_config["collate_fn_args"]:
-                    self.pred_config["collate_fn_args"]["generator"] = torch.Generator().manual_seed(self.seed) 
+                    self.pred_config["collate_fn_args"]["generator"] = torch.Generator().manual_seed(self.seed)
+
+                # Uses optional rotary_config from pred_config.yaml else uses one provided by model_config.yaml
+                if self.pred_config["collate_fn_class"] == "PredModRopeCollateFn":
+                    if "rotary_config" in self.pred_config:
+                        self.pred_config["collate_fn_args"]["rotary_config"] = self.pred_config["rotary_config"]
+                    else:
+                        self.pred_config["collate_fn_args"]["rotary_config"] = self.rotary_config
+
             collate_fn = collate_fn_registry[self.pred_config["collate_fn_class"]](
                 tokenizer=self.tokenizer,
                 **self.pred_config["collate_fn_args"],
@@ -657,13 +652,13 @@ def var_len_bucket_worker_init_fn(worker_id, base_length=5024):
 dataset_registry = {
     "FastaDataset": FastaDataset,
     "MultiFastaDataset": MultiFastaDataset,
-    "PredDataset": PredDataset,
+    #"PredDataset": PredDataset,
 }
 
 collate_fn_registry = {
     "CollateFn": CollateFn,
     "NucleotideSeqBatchFromHFTokenizerConverter": NucleotideSeqBatchFromHFTokenizerConverter,
     "ModRopeCollateFn": ModRopeCollateFn,
-    "PredCollateFn": PredCollateFn,
-    "PredModRopeCollateFn": PredModRopeCollateFn,
+    #"PredCollateFn": PredCollateFn,
+    #"PredModRopeCollateFn": PredModRopeCollateFn,
 }
