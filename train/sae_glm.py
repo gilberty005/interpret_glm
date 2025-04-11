@@ -36,7 +36,8 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 import pandas as pd
 from dataset.inference_utils import ModRoPE
-
+from lightning.pytorch.loggers.wandb import WandbLogger
+from lightning.pytorch.callbacks import ModelSummary  
 def create_file(dir: str, file_name: str) -> None:
     if not os.path.isdir(dir):
         raise ValueError(f"The specified directory '{dir}' does not exist.")
@@ -358,10 +359,10 @@ def loss_fn(
 
 
 """#ESM Wrapper"""
-import pytorch_lightning as pl
 import torch
 import torch.nn as nn
 from esm.modules import ESM1bLayerNorm, RobertaLMHead, TransformerLayer
+import lightning.pytorch as pl
 
 class ESM2Model(pl.LightningModule):
     def __init__(self, num_layers, embed_dim, attention_heads, alphabet, token_dropout):
@@ -524,7 +525,7 @@ def calc_loss_recovered(seq, layer, esm2_model, sae_model):
 """#SAE Module"""
 
 import esm
-import pytorch_lightning as pl
+import lightning.pytorch as pl
 import torch
 import torch.nn.functional as F
 
@@ -734,9 +735,10 @@ import wandb
 import numpy as np
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
-
-#wandb.login(key="d21c34085b863cf1b81896183cf457035c56f923")
-
+import lightning.pytorch as pl
+wandb.login(key="622b67a1886cbe905b4772fceac05f6edd8a1b43")
+from lightning.pytorch.loggers.wandb import WandbLogger
+from lightning.pytorch.callbacks import ModelSummary, ModelCheckpoint
 #change to load from checkpoint -- what is our alphabet?
 #model_weights, alphabet = esm.pretrained.esm2_t33_650M_UR50D()
 
@@ -750,8 +752,8 @@ from transformers import AutoTokenizer, AutoModelForMaskedLM
 # drive.mount('/content/drive')
 
 #wandb.finish()
-config_yaml_path = '/p/vast1/OpenFoldCollab/genome_lm/experiments/glm_SAE/configs/esm3s_12l_varlen8k_38M.yaml'
-ckpt_path = '/p/vast1/kalicki1/training/output/esm3s_12l_varlen8k_38M_GTDB_train/ckpt/esm3s_12l_varlen8k_38M_GTDB_train_t0_f0_step198000_lastval_gtdb_rep_mlm_ece2.70_failure.ckpt'
+config_yaml_path = '/eagle/MLProtein/ckalicki/glm_sae/glm_SAE/configs/esm3s_12l_varlen8k_38M.yaml'
+ckpt_path = '/eagle/MLProtein/ckalicki/glm_sae/glm_SAE/interpret_glm/esm3s_12l_varlen8k_38M_GTDB_train_t0_f0_step198000_lastval_gtdb_rep_mlm_ece2.70_failure.ckpt'
 with open(config_yaml_path, 'r') as infile:
         run_configs = yaml.safe_load(infile)
 # Load and connect tokenizer
@@ -766,16 +768,16 @@ args = SimpleNamespace(
     config_yaml=config_yaml_path,
     ckpt=ckpt_path,
     #esm2_weight = "https://dl.fbaipublicfiles.com/fair-esm/models/esm2_t33_650M_UR50D.pt",
-    layer_to_use=24,
-    d_model=1280,
-    d_hidden=16384,
-    batch_size=24,
+    layer_to_use=6,
+    d_model=512,
+    d_hidden=2048,
+    batch_size=8,
     lr=2e-4,
     k=128,
     auxk=256,
     dead_steps_threshold=2000,
     max_epochs=1,
-    num_devices=-1,
+    num_devices=1,
     tokenizer=tokenizer,
 )
 
@@ -784,14 +786,14 @@ args.output_dir = f"results_l{args.layer_to_use}_dim{args.d_hidden}_k{args.k}"
 if not os.path.exists(args.output_dir):
     os.mkdir(args.output_dir)
 
-sae_name = f"esm2_plm1280_l{args.layer_to_use}_sae{args.d_hidden}_k{args.k}_auxk{args.auxk}"
-'''
+sae_name = f"glm_sae_l{args.layer_to_use}_sae{args.d_hidden}_k{args.k}_auxk{args.auxk}"
+
 wandb_logger = WandbLogger(
     project="interpretability",
     name=sae_name,
     save_dir=os.path.join(args.output_dir, "wandb"),
 )
-'''
+
 #change this
 with open(args.config_yaml, 'r') as infile:
         run_configs = yaml.safe_load(infile)
@@ -800,28 +802,14 @@ with open(args.config_yaml, 'r') as infile:
 # Rotary config depends on train_config collate_fn_args !!
 rotary_config = run_configs['data']['valid_config']['gtdb_rep_mlm']['collate_fn_args']['rotary_config']
         
-# Override config for inference setting
-run_configs['model']['transformer_layer']['attn_method'] = 'torch' 
-run_configs['training']['pl_strategy'] = {'class': 'Single','args':{'device': 0, }}
-     
-# Load RoPE
-modrope = ModRoPE(rotary_config)
-
-# Load model
-glm_model = model_registry[run_configs['model_class']](run_configs, tokenizer)
-ckpt = torch.load(args.ckpt)['state_dict']
-ckpt = {k.replace('model._orig_mod.', ''): v for k, v in ckpt.items()}
-glm_model.load_state_dict(ckpt, strict=False)
-#glm_model = glm_model.to(device)
-
 model = SAELightningModule(args)
 run_configs["data"]["tokenizer"] = tokenizer
-run_configs["data"]["rotary_config"] = run_configs['data']['valid_config']['gtdb_rep_mlm']['collate_fn_args']['rotary_config']
+
 lit_data = datamodule_registry[run_configs["datamodule_class"]](
             **run_configs["data"]
         )
 
-'''
+
 checkpoint_callback = ModelCheckpoint(
     dirpath=os.path.join(args.output_dir, "checkpoints"),
     filename=sae_name + "-{step}-{val_loss:.2f}",
@@ -831,7 +819,7 @@ checkpoint_callback = ModelCheckpoint(
     save_last=True,
 )
 
-trainer = pl_lightning.Trainer(
+trainer = pl.Trainer(
     max_epochs=args.max_epochs,
     accelerator="gpu",
     devices=list(range(args.num_devices)),
@@ -844,8 +832,8 @@ trainer = pl_lightning.Trainer(
     gradient_clip_val=1.0,
 )
 
-trainer.fit(model, data_module, ckpt_path="/burg/pmg/users/gy2322/results_l24_dim16384_k128/checkpoints/esm2_plm1280_l24_sae16384_k128_auxk256-step=4000-val_loss=16.12.ckpt")
-trainer.test(model, data_module)
+trainer.fit(model, lit_data)
+trainer.test(model, lit_data)
 
 wandb.finish()
-'''
+

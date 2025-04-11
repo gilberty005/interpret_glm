@@ -178,3 +178,4 @@ class ReadCache:
     def __del__(self):
         if self.con is not None:
             self.con.close()
+

@@ -378,6 +378,40 @@ class ESM3s(nn.Module):
             reshard_after_forward=parallel_config["FSDP_reshard"], **fsdp_config)
         model = fully_shard(model, reshard_after_forward=False, **fsdp_config)
         return model
+    
+    def compose_input(self, list_tuple_seq):
+        _, _, batch_tokens = self.batch_converter(list_tuple_seq)
+        batch_tokens = batch_tokens.to(self.device)
+        return batch_tokens
+
+    def get_layer_activations(self, input, layer_idx):
+        if isinstance(input, str):
+            tokens = self.compose_input([("protein", input)])
+        elif isinstance(input, list):
+            tokens = self.compose_input([("protein", seq) for seq in input])
+        else:
+            tokens = input
+
+        x = self.embed_scale * self.embed_tokens(tokens)
+        x = x.transpose(0, 1)  # (B, T, E) => (T, B, E)
+        for _, layer in enumerate(self.layers[:layer_idx]):
+            x, attn = layer(
+                x,
+                self_attn_padding_mask=None,
+                need_head_weights=False,
+            )
+        return tokens, x.transpose(0, 1)
+
+    def get_sequence(self, x, layer_idx):
+        x = x.transpose(0, 1)  # (B, T, E) => (T, B, E)
+        for _, layer in enumerate(self.layers[layer_idx:]):
+            x, attn = layer(
+                x,
+            )
+        x = self.emb_layernorm_after(x)
+        x = x.transpose(0, 1)  # (T, B, E) => (B, T, E)
+        logits = self.lm_head(x)
+        return logits
 
     def forward(
         self,

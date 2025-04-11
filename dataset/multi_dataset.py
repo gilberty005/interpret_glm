@@ -94,3 +94,4 @@ class MultiFastaDataset(Dataset):
         # TODO correctly set the seed and generator
         seqs = self.datasets[dataset_idx].__getitem__(cluster_idx, intput_cluster_idx=True)
         return seqs
+    
