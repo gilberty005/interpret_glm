@@ -385,31 +385,35 @@ class ESM3s(nn.Module):
         return batch_tokens
 
     def get_layer_activations(self, input, layer_idx):
+        
         if isinstance(input, str):
             tokens = self.compose_input([("protein", input)])
         elif isinstance(input, list):
             tokens = self.compose_input([("protein", seq) for seq in input])
         else:
             tokens = input
-
-        x = self.embed_scale * self.embed_tokens(tokens)
-        x = x.transpose(0, 1)  # (B, T, E) => (T, B, E)
+        
+        cos, sin = self.get_rope_tensor(rotary_length=tokens.shape[0])
+        x = self.embed_tokens(tokens)
+        if x.ndim == 2:
+            x = x.unsqueeze(0)
         for _, layer in enumerate(self.layers[:layer_idx]):
-            x, attn = layer(
+            x = layer(
                 x,
-                self_attn_padding_mask=None,
-                need_head_weights=False,
+                cos_cached=cos,
+                sin_cached=sin,
             )
-        return tokens, x.transpose(0, 1)
+        return tokens, x
 
     def get_sequence(self, x, layer_idx):
-        x = x.transpose(0, 1)  # (B, T, E) => (T, B, E)
+        cos, sin = self.get_rope_tensor(rotary_length=x.shape[1]) 
         for _, layer in enumerate(self.layers[layer_idx:]):
-            x, attn = layer(
+            x = layer(
                 x,
+                cos_cached=cos,
+                sin_cached=sin,
             )
         x = self.emb_layernorm_after(x)
-        x = x.transpose(0, 1)  # (T, B, E) => (B, T, E)
         logits = self.lm_head(x)
         return logits
 

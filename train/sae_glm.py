@@ -593,28 +593,24 @@ class SAELightningModule(pl.LightningModule):
         print(len(self.alphabet))
         # Initialize esm2_model here
         #self.esm2_model = get_esm_model(self.args.d_model, self.alphabet, self.args.esm2_weight)
-        
+        print(args)
+        print(self.args)
+        print(self.args.config_yaml)
 
 
     def forward(self, x):
         return self.sae_model(x)
 
     def training_step(self, batch, batch_idx):
-        seqs = batch["Sequence"]
-        batch_size = len(seqs)
+        seqs, noised_tokens, tokens, noise_mask = batch
+        batch_size = len(noised_tokens)
         # Use the pre-initialized esm2_model
         #to do edit this
         with torch.no_grad():
-            tokens, esm_layer_acts = self.esm2_model.get_layer_activations(seqs, self.layer_to_use)
+            tokens, esm_layer_acts = self.glm_model.get_layer_activations(noised_tokens, self.layer_to_use)
         recons, auxk, num_dead = self(esm_layer_acts)
         mse_loss, auxk_loss = loss_fn(esm_layer_acts, recons, auxk)
-        '''
-        with torch.no_grad():
-            esm2_model = get_esm_model(self.args.d_model, self.alphabet, self.args.esm2_weight)
-            tokens, esm_layer_acts = esm2_model.get_layer_activations(seqs, self.layer_to_use)
-        recons, auxk, num_dead = self(esm_layer_acts)
-        mse_loss, auxk_loss = loss_fn(esm_layer_acts, recons, auxk)
-        '''
+        
         loss = mse_loss + auxk_loss
         self.log(
             "train_loss",
@@ -652,23 +648,21 @@ class SAELightningModule(pl.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        val_seqs = batch["Sequence"]
-        batch_size = len(val_seqs)
+        #val_seqs = batch["Sequence"]
+        seqs, noised_tokens, tokens, noise_mask = batch
+        batch_size = len(noised_tokens)
         # Use the pre-initialized esm2_model
-        '''
+        
         with torch.no_grad():
-            esm2_model = self.esm2_model
-        '''
-        with torch.no_grad():
-            esm2_model = get_esm_model(
-                self.args.d_model, self.alphabet, self.args.esm2_weight
+            esm2_model = get_glm_model(
+                self.args, self.alphabet
             )
 
         diff_CE_all = torch.zeros(batch_size, device=self.device)
         mse_loss_all = torch.zeros(batch_size, device=self.device)
-
+        
         # Running inference one sequence at a time
-        for i, seq in enumerate(val_seqs):
+        for i, seq in enumerate(noised_tokens):
             tokens, esm_layer_acts = esm2_model.get_layer_activations(
                 seq, self.layer_to_use
             )
