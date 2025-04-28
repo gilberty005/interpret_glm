@@ -405,7 +405,7 @@ class DNATrainDataModule(L.LightningDataModule):
         ):
             sampler_kwargs = self.trainer.strategy.distributed_sampler_kwargs
             sampler = torch.utils.data.DistributedSampler(
-                self.train_ds, shuffle=True, **sampler_kwargs
+                self.train_ds, shuffle=True, seed=420, **sampler_kwargs
             )
             shuffle = None
         else:
