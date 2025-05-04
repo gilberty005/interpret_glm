@@ -179,37 +179,16 @@ class SparseAutoencoder(nn.Module):
         x: torch.Tensor,
         k: int
     ) -> torch.Tensor:
-        """
-        Batch-TopK activation: across a batch of size B, keeps only the k*B largest
-        elements (after ReLU) in the entire tensor and zeroes out the rest.
-
-        Args:
-            x (torch.Tensor): input of shape (B, ...).
-            k (int): topbk per sample.  Total kept = k * B.
-
-        Returns:
-            torch.Tensor: same shape as x, with only the top k*B positive entries retained.
-        """
+        
         B = x.shape[0]
         total_keep = k * B
-
-        # flatten the entire tensor into one dimension
         flat = x.view(-1)
-
-        # guard against asking for more elements than exist
         total_keep = min(total_keep, flat.numel())
-
-        # find top total_keep entries
         topk = torch.topk(flat, k=total_keep, dim=0, largest=True, sorted=False)
-
-        # apply ReLU to those values
         activated = F.relu(topk.values)
-
-        # build the output: zeros everywhere except at the topbk indices
         out_flat = torch.zeros_like(flat)
         out_flat[topk.indices] = activated
 
-        # reshape back to original
         return out_flat.view_as(x)
     
     def LN(
@@ -290,21 +269,7 @@ class SparseAutoencoder(nn.Module):
             torch.zeros_like(self.stats_last_nonzero),    # reset to 0 on fire
             self.stats_last_nonzero + 1                   # otherwise increment
         )
-        # 1) find which dims actually fired *anywhere* in this batch
-        #   fired: BoolTensor of shape (D_HIDDEN,)
-        #fired = latents.ne(0).any(dim=(0, 1))
-
-        # 2) update stats_last_nonzero:
-        #    if fired[i] == True  b reset to 0  
-        #    else                b increment by 1  
-        #self.stats_last_nonzero = torch.where(
-         #   fired,
-          #  torch.zeros_like(self.stats_last_nonzero),
-           # self.stats_last_nonzero + 1,
-        #)
-
-        # 3) now your usual dead_mask  
-        #dead_mask = self.auxk_mask_fn(self.stats_last_nonzero)
+        
         dead_mask = self.auxk_mask_fn()
         num_dead = dead_mask.sum().item()
 
@@ -313,7 +278,7 @@ class SparseAutoencoder(nn.Module):
 
         if num_dead > 0:
             k_aux = min(x.shape[-1] // 2, num_dead)
-
+            k_aux = self.auxk
             auxk_latents = torch.where(dead_mask[None], pre_acts, -torch.inf)
             #auxk_acts = self.batch_topk_activation(auxk_latents, k=k_aux)
             auxk_acts = self.topK_activation(auxk_latents, k=k_aux)
@@ -491,18 +456,10 @@ def get_glm_model(args, alphabet):
     with open(args.config_yaml, 'r') as infile:
         run_configs = yaml.safe_load(infile)
 
-
-    # Rotary config depends on train_config collate_fn_args !!
     rotary_config = run_configs['data']['valid_config']['gtdb_rep_mlm']['collate_fn_args']['rotary_config']
-
-    # Override config for inference setting
     run_configs['model']['transformer_layer']['attn_method'] = 'torch'
     run_configs['training']['pl_strategy'] = {'class': 'Single','args':{'device': 0, }}
-
-    # Load RoPE
     modrope = ModRoPE(rotary_config)
-
-    # Load model
     glm_model = model_registry[run_configs['model_class']](run_configs, args.tokenizer)
     ckpt = torch.load(args.ckpt)['state_dict']
     ckpt = {k.replace('model._orig_mod.', ''): v for k, v in ckpt.items()}
@@ -542,10 +499,6 @@ class SAELightningModule(pl.LightningModule):
         #to do edit this
         with torch.no_grad():
             tokens, esm_layer_acts = self.glm_model.get_layer_activations(tokens, self.layer_to_use)
-            print('-----------------------')
-            print(esm_layer_acts.shape)
-            print(esm_layer_acts)
-            print('esm layer acts ^^^^^^^')
         recons, auxk, num_dead = self(esm_layer_acts)
         mse_loss, auxk_loss = loss_fn(esm_layer_acts, recons, auxk)
         
@@ -656,57 +609,7 @@ class SAELightningModule(pl.LightningModule):
     def on_after_backward(self):
         self.sae_model.norm_weights()
         self.sae_model.norm_grad()
-    ''' 
-    def configure_optimizers(self):
-        from torch.optim import Adam
-        from torch.optim.lr_scheduler import LinearLR, ConstantLR, SequentialLR
-        optimizer = Adam(self.parameters(), lr=self.args.lr)
 
-        # 1) linear warmbup from 0 b 1Clr over `warmup_steps`
-        warmup = LinearLR(
-            optimizer,
-            start_factor=1.0,
-            end_factor=1.0,
-            total_iters=4800,
-        )
-
-        # 2) hold at 1Clr for `plateau_steps`
-        plateau = ConstantLR(
-            optimizer,
-            factor=1.0,
-            total_iters=32000,
-        )
-
-        # 3) linear decay from 1Clr b 0 over `decay_steps`
-        decay = LinearLR(
-            optimizer,
-            start_factor=1.0,
-            end_factor=0.1,
-            total_iters=4800,
-        )
-
-        # stitch them together
-        scheduler = SequentialLR(
-            optimizer,
-            schedulers=[warmup, plateau, decay],
-            # after `warmup_steps`: switch to plateau
-            # after `warmup_steps + plateau_steps`: switch to decay
-            milestones=[
-                4800,
-                4800 + 32000,
-            ],
-        )
-
-        # Lightning needs this dict to know when/where to step
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "interval": "step",    # call .step() every training step
-                "frequency": 1,
-            },
-        }
-    '''
 """#Training"""
 def main():
     # Parse command-line arguments
@@ -727,43 +630,43 @@ def main():
         '--layer',
         type=int,
         required=True,
-        help='Path to the checkpoint file'
+        help='layer to use'
     )
     parser.add_argument(
         '--param',
         type=str,
         required=True,
-        help='Path to the checkpoint file'
+        help='size of model'
     )
     parser.add_argument(
         '--lr',
         type=float,
         required=True,
-        help='Path to the checkpoint file'
+        help='learning rate'
     )
     parser.add_argument(
         '--d_hidden',
         type=int,
         required=True,
-        help='Path to the checkpoint file'
+        help='hidden dim of SAE'
     )
     parser.add_argument(
         '--k',
         type=int,
         required=True,
-        help='Path to the checkpoint file'
+        help='top k for reconstruction'
     )
     parser.add_argument(
         '--auxk',
         type=int,
         required=True,
-        help='Path to the checkpoint file'
+        help='k for auxiliary loss'
     )
     args_cli = parser.parse_args()
 
     config_yaml_path = args_cli.config_yaml_path
     ckpt_path = args_cli.ckpt_path
-    wandb.login(key="622b67a1886cbe905b4772fceac05f6edd8a1b43")
+    wandb.login(key="")
     with open(config_yaml_path, 'r') as infile:
         run_configs = yaml.safe_load(infile)
     # Load and connect tokenizer
@@ -778,9 +681,9 @@ def main():
         config_yaml=config_yaml_path,
         ckpt=ckpt_path,
         layer_to_use=args_cli.layer,
-        d_model=512,
+        d_model=1024,
         d_hidden=args_cli.d_hidden,
-        batch_size=8,
+        batch_size=32,
         lr=args_cli.lr,
         k=args_cli.k,
         auxk=args_cli.auxk,
@@ -822,7 +725,7 @@ def main():
     checkpoint_callback = ModelCheckpoint(
         dirpath=os.path.join(args.output_dir, "checkpoints"),
         filename=sae_name + "-{step}-{val_loss:.2f}",
-        save_top_k=3,
+        save_top_k=-1,
         monitor="val_loss",
         mode="min",
         save_last=True,
